@@ -4,8 +4,9 @@ import java.util.*;
 class Bank {
 
     private static class Account {
-    private int balance;
-    private final ReentrantReadWriteLock rwl = new ReentrantReadWriteLock();
+        private int balance;
+        private final ReentrantReadWriteLock rwl = new ReentrantReadWriteLock();
+
         // read/write lock helpers
         void readLock() { rwl.readLock().lock(); }
         void readUnlock() { rwl.readLock().unlock(); }
@@ -18,101 +19,103 @@ class Bank {
         boolean withdrawNoLock(int v) {
             if (v > balance) return false;
             balance -= v; return true;
-    }
+        }
     }
 
-    private Map<Integer, Account> map = new HashMap<Integer, Account>();
+    private final Map<Integer, Account> map = new HashMap<>();
     private int nextId = 0;
-    private ReentrantReadWriteLock l = new ReentrantReadWriteLock();
+    private final ReentrantReadWriteLock bankLock = new ReentrantReadWriteLock();
 
     // create account and return account id
     public int createAccount(int balance) {
-        l.readLock().lock();
-        try{
-            int id = nextId;
+        // changing accounts map -> need write lock
+        bankLock.writeLock().lock();
+        try {
+            int id = nextId++;
             map.put(id, new Account(balance));
             return id;
-        }
-        finally{
-            l.unlock();
+        } finally {
+            bankLock.writeLock().unlock();
         }
     }
 
     // close account and return balance, or 0 if no such account
     public int closeAccount(int id) {
-        l.lock();
+        // need write lock to remove from map
+        bankLock.writeLock().lock();
         Account c;
-        try{
+        try {
             c = map.get(id);
             if (c == null) return 0;
-            c.lock();
-            try{
+            // lock account while holding map write lock to avoid races
+            c.writeLock();
+            try {
                 map.remove(id);
-                return c.balance();
+                return c.balanceNoLock();
+            } finally {
+                c.writeUnlock();
             }
-            finally{
-                c.unlock();
-            }
-        }
-        finally{
-            l.unlock();
+        } finally {
+            bankLock.writeLock().unlock();
         }
     }
 
     // account balance; 0 if no such account
     public int balance(int id) {
-        l.readLock().lock();
+        bankLock.readLock().lock();
         Account c;
-        try{
+        try {
             c = map.get(id);
             if (c == null) return 0;
+            // acquire account read lock while map read lock held
             c.readLock();
+        } finally {
+            bankLock.readLock().unlock();
         }
-        finally{
-            l.readLock().unlock();
-        }
-        try{
+
+        try {
             return c.balanceNoLock();
-        }
-        finally{
+        } finally {
             c.readUnlock();
         }
     }
 
     // deposit; fails if no such account
     public boolean deposit(int id, int value) {
-        l.readLock().lock();
+        if (value < 0) return false;
+        bankLock.readLock().lock();
         Account c;
-        try{
+        try {
             c = map.get(id);
+            if (c == null) return false;
             c.writeLock();
+        } finally {
+            bankLock.readLock().unlock();
         }
-        finally{
-            l.readLock().unlock();
-        }
-        try{
+
+        try {
             return c.depositNoLock(value);
-        }
-        finally{
+        } finally {
             c.writeUnlock();
         }
     }
 
     // withdraw; fails if no such account or insufficient balance
     public boolean withdraw(int id, int value) {
-        l.readLock().lock();
+        if (value < 0) return false;
+        bankLock.readLock().lock();
         Account c;
-        try{
+        try {
             c = map.get(id);
+            if (c == null) return false;
             c.writeLock();
+        } finally {
+            bankLock.readLock().unlock();
         }
-        finally{
-            l.readLock().unlock();
-        }
-        try{
+
+        try {
             return c.withdrawNoLock(value);
-        }
-        finally{
+        } finally {
             c.writeUnlock();
         }
     }
@@ -120,69 +123,60 @@ class Bank {
     // transfer value between accounts;
     // fails if either account does not exist or insufficient balance
     public boolean transfer(int from, int to, int value) {
-        l.readLock().lock();
-        Account cfrom;
-        Account cto;
-        try{
-            cfrom = map.get(from);
-            cto = map.get(to);
-            if (cfrom == null || cto == null || cfrom == cto) {
-                return false;
-            }
-            if (from < to) {
-                cfrom.writeLock();
-                cto.writeLock();
-            }
-            else{
-                cto.writeLock();
-                cfrom.writeLock();
-            }
+        if (value < 0) return false;
+        if (from == to) return true;
+
+        bankLock.readLock().lock();
+        Account aFrom;
+        Account aTo;
+        try {
+            aFrom = map.get(from);
+            aTo = map.get(to);
+            if (aFrom == null || aTo == null) return false;
+
+            // lock accounts in id order to avoid deadlock
+            if (from < to) { aFrom.writeLock(); aTo.writeLock(); }
+            else { aTo.writeLock(); aFrom.writeLock(); }
+        } finally {
+            bankLock.readLock().unlock();
         }
-        finally{
-            l.readLock().unlock();
-        }
-        try{
-            return cfrom.withdrawNoLock(value) && cto.depositNoLock(value);
-        }
-        finally{
-            if (from < to) {
-                cfrom.writeUnlock();
-                cto.writeUnlock();
-            }
-            else{
-                cto.writeUnlock();
-                cfrom.writeUnlock();
-            }
+
+        try {
+            if (!aFrom.withdrawNoLock(value)) return false;
+            aTo.depositNoLock(value);
+            return true;
+        } finally {
+            // unlock in reverse order
+            if (from < to) { aTo.writeUnlock(); aFrom.writeUnlock(); }
+            else { aFrom.writeUnlock(); aTo.writeUnlock(); }
         }
     }
 
     // sum of balances in set of accounts; 0 if some does not exist
     public int totalBalance(int[] ids) {
-        l.readLock().lock();
+        bankLock.readLock().lock();
         Map<Integer, Account> contas = new HashMap<>();
-        try{
+        try {
             for (int id : ids) {
                 Account c = map.get(id);
+                if (c == null) return 0;          // if any id invalid -> fail
                 contas.putIfAbsent(id, c);
             }
             List<Integer> unique = new ArrayList<>(contas.keySet());
             Collections.sort(unique);
-            for(int id : unique) contas.get(id).readLock();
+            for (int id : unique) contas.get(id).readLock();
+        } finally {
+            bankLock.readLock().unlock();
         }
-        finally{
-            l.readLock().unlock();
-        }
-        try{
+
+        try {
             int total = 0;
-            for(int id:ids){
-                total += contas.get(id).balanceNoLock();
-            }
+            for (int id : ids) total += contas.get(id).balanceNoLock();
             return total;
-        }
-        finally{
+        } finally {
             List<Integer> unique = new ArrayList<>(contas.keySet());
-            Collections.sort(unique,Collections.reverseOrder());
-            for(int id : unique) contas.get(id).readUnlock();
+            Collections.sort(unique, Collections.reverseOrder());
+            for (int id : unique) contas.get(id).readUnlock();
         }
     }
 
