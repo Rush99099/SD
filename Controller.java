@@ -20,7 +20,7 @@ class Controller{
     }
 
     void request_resource(int i) throws InterruptedException{
-        l.lock();
+        l.lock();   
         try{
             waiting[i] += 1;
             while (using[1-i] > 0 || (using[i] >= T) || (waiting[1-i] > 0 && credit[i] == 0)){ 
