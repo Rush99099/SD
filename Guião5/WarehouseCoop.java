@@ -1,6 +1,6 @@
 import java.util.*;
 
-class Warehouse {
+class WarehouseCoop {
     private Map<String, Product> map =  new HashMap<String, Product>();
 
     private class Product { int quantity = 0; }
